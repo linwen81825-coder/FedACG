@@ -28,7 +28,7 @@ class Client():
         self.args = args
         self.client_index = client_index
         self.model = model
-        self.global_model =  copy.deepcopy(model)
+        self.global_model = copy.deepcopy(model)
         for par in self.global_model.parameters():
             par.requires_grad = False
 
@@ -46,48 +46,57 @@ class Client():
         self.device = device
 
         if self.args.dataset.num_instances > 0:
-            train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances)   
+            train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances)
         else:
             train_sampler = None
-        self.loader =  DataLoader(local_dataset, batch_size=self.args.batch_size, sampler=train_sampler, shuffle=train_sampler is None,
-                                   num_workers=self.args.num_workers, pin_memory=self.args.pin_memory)
-        
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=local_lr, momentum=self.args.optimizer.momentum,
-                                   weight_decay=self.args.optimizer.wd)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=self.optimizer, 
-                                                     lr_lambda=lambda epoch: self.args.trainer.local_lr_decay ** epoch)
-    
+        self.loader = DataLoader(
+            local_dataset,
+            batch_size=self.args.batch_size,
+            sampler=train_sampler,
+            shuffle=train_sampler is None,
+            num_workers=self.args.num_workers,
+            pin_memory=self.args.pin_memory
+        )
+
+        self.optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=local_lr,
+            momentum=self.args.optimizer.momentum,
+            weight_decay=self.args.optimizer.wd
+        )
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer=self.optimizer,
+            lr_lambda=lambda epoch: self.args.trainer.local_lr_decay ** epoch
+        )
+
         self.trainer = trainer
         self.num_layers = self.model.num_layers
         self.class_counts = np.sort([*local_dataset.class_dict.values()])[::-1]
         if global_epoch == 0:
             logger.info(f"Class counts : {self.class_counts}")
 
-        #For FedLC
+        # For FedLC
         if self.args.client.get('LC'):
             self.class_stats = {
-            'ratio': None,
+                'ratio': None,
             }
             self.num_classes = len(self.loader.dataset.dataset.classes)
             self.class_stats['ratio'] = torch.zeros(self.num_classes)
             for class_key in local_dataset.class_dict:
                 self.class_stats['ratio'][int(class_key)] = local_dataset.class_dict[class_key]
             sorted_key = np.sort([*local_dataset.class_dict.keys()])
-            sorted_class_dict = {} 
-            for key in sorted_key:  
+            sorted_class_dict = {}
+            for key in sorted_key:
                 sorted_class_dict[key] = local_dataset.class_dict[key]
             self.label_distrib = torch.zeros(len(local_dataset.dataset.classes), device=self.device)
             for key in sorted_class_dict:
                 self.label_distrib[int(key)] = sorted_class_dict[key]
 
-        #For FedDyn
+        # For FedDyn
         if self.args.client.get('Dyn'):
-            self.local_deltas = (kwargs['past_local_deltas'])
+            self.local_deltas = kwargs['past_local_deltas']
             self.user = kwargs['user']
             self.local_delta = copy.deepcopy(self.local_deltas[self.user])
-
-
-        
 
     def _update_model(self, state_dict):
         self.model.load_state_dict(state_dict)
@@ -118,10 +127,15 @@ class Client():
 
         if self.args.client.get('NTD'):
             weights['NTD'] = self.args.client.NTD.weight
-            weights["cls"] = 1-self.args.client.NTD.weight
+            weights["cls"] = 1 - self.args.client.NTD.weight
 
         if self.args.client.get('Dyn'):
             weights['Dyn'] = self.args.client.Dyn.weight
+
+        # Add the MoE load-balancing loss only when the MoE model is selected.
+        if self.args.model.get('moe', False):
+            weights['moe_aux'] = float(self.args.model.get('aux_loss_weight', 0.01))
+
         return weights
 
     def local_train(self, global_epoch, **kwargs):
@@ -143,16 +157,16 @@ class Client():
             end = time.time()
 
             for i, (images, labels) in enumerate(self.loader):
-                    
+
                 images, labels = images.to(self.device), labels.to(self.device)
                 self.model.zero_grad()
 
                 with autocast(enabled=self.args.use_amp):
                     losses = self._algorithm(images, labels)
-                    # for loss_key in losses:
-                    #     if loss_key not in self.weights.keys():
-                    #         self.weights[loss_key] = 0
-                    loss = sum([self.weights[loss_key]*losses[loss_key] for loss_key in losses])
+                    loss = sum([
+                        self.weights[loss_key] * losses[loss_key]
+                        for loss_key in losses
+                    ])
 
                 try:
                     scaler.scale(loss).backward()
@@ -169,7 +183,7 @@ class Client():
                 end = time.time()
 
             self.scheduler.step()
-        
+
         logger.info(f"[C{self.client_index}] End. Time: {end-start:.2f}s, Loss: {loss_meter.avg:.3f}")
 
         self.model.to('cpu')
@@ -180,68 +194,85 @@ class Client():
 
         if self.args.client.get('Dyn'):
             with torch.no_grad():
-                fixed_params = {n:p for n,p in self.global_model.named_parameters()}
+                fixed_params = {n: p for n, p in self.global_model.named_parameters()}
                 for n, p in self.model.named_parameters():
-                    self.local_deltas[self.user][n] = (self.local_delta[n] - self.args.client.Dyn.alpha * (p - fixed_params[n]).detach().clone().to('cpu'))
-
+                    self.local_deltas[self.user][n] = (
+                        self.local_delta[n]
+                        - self.args.client.Dyn.alpha
+                        * (p - fixed_params[n]).detach().clone().to('cpu')
+                    )
 
         gc.collect()
-        
-        return self.model.state_dict(), loss_dict
-    
 
-    def _algorithm(self, images, labels, ) -> Dict:
+        return self.model.state_dict(), loss_dict
+
+    def _algorithm(self, images, labels) -> Dict:
         losses = defaultdict(float)
 
         results = self.model(images)
         cls_loss = self.criterion(results["logit"], labels)
         losses["cls"] = cls_loss
-        ## Weight L2 loss
+
+        # MoE load-balancing auxiliary loss.
+        if "aux_loss" in results:
+            losses["moe_aux"] = results["aux_loss"]
+
+        # Weight L2 loss
         if self.args.client.get('prox_loss'):
             prox_loss = 0
-            fixed_params = {n:p for n,p in self.global_model.named_parameters()}
+            fixed_params = {n: p for n, p in self.global_model.named_parameters()}
             for n, p in self.model.named_parameters():
-                prox_loss += ((p-fixed_params[n].detach())**2).sum()  
+                prox_loss += ((p - fixed_params[n].detach()) ** 2).sum()
             losses["prox"] = prox_loss
 
-        #FedLC
+        # FedLC
         if self.args.client.get('LC'):
-            LC_loss = self.FedLC_criterion(self.label_distrib, results["logit"], labels, self.args.client.LC.tau)
+            LC_loss = self.FedLC_criterion(
+                self.label_distrib, results["logit"], labels, self.args.client.LC.tau
+            )
             losses["LC"] = LC_loss
 
-        #FedDecorr
+        # FedDecorr
         if self.args.client.get('decorr_loss'):
             decorr_loss = self.decorr_criterion(results["feature"])
             losses["decorr"] = decorr_loss
-        
-        #FedMLB
+
+        # FedMLB
         if self.args.client.get('MLB'):
             MLB_args = self.args.client.MLB
             cls_branch = []
             kl_branch = []
 
             for l in range(self.num_layers):
-                if l in MLB_args.branch_level:         
-                    global_results = self.global_model(results[f"layer{l}"], mlb_level=l+1)
+                if l in MLB_args.branch_level:
+                    global_results = self.global_model(results[f"layer{l}"], mlb_level=l + 1)
                     cls_branch.append(self.criterion(global_results["logit"], labels))
-                    kl_branch.append(KD(global_results["logit"], results["logit"], T=MLB_args.Temp))
-            losses["MLB_branch_cls"] = sum(cls_branch)/len(cls_branch)
-            losses["MLB_branch_kl"] = sum(kl_branch)/len(kl_branch)
+                    kl_branch.append(KD(
+                        global_results["logit"], results["logit"], T=MLB_args.Temp
+                    ))
+            losses["MLB_branch_cls"] = sum(cls_branch) / len(cls_branch)
+            losses["MLB_branch_kl"] = sum(kl_branch) / len(kl_branch)
             del global_results
 
-        #FedNTD
+        # FedNTD
         if self.args.client.get("NTD"):
             with torch.no_grad():
                 global_results = self.global_model(images)
             batch_size = labels.size(0)
             idxs = torch.arange(results['logit'].size(1)).unsqueeze(0).repeat(batch_size, 1)
             not_true_idx = idxs.to(self.device) != labels.unsqueeze(1)
-            not_true_logits = results['logit'][not_true_idx].view(batch_size, results['logit'].size(1) - 1)
-            not_true_logits_global = global_results['logit'][not_true_idx].view(batch_size, results['logit'].size(1) - 1)
-            losses["NTD"] = KD(not_true_logits_global, not_true_logits, T=self.args.client.NTD.Temp)
+            not_true_logits = results['logit'][not_true_idx].view(
+                batch_size, results['logit'].size(1) - 1
+            )
+            not_true_logits_global = global_results['logit'][not_true_idx].view(
+                batch_size, results['logit'].size(1) - 1
+            )
+            losses["NTD"] = KD(
+                not_true_logits_global, not_true_logits, T=self.args.client.NTD.Temp
+            )
             del global_results
 
-        #FedDyn
+        # FedDyn
         if self.args.client.get('Dyn'):
             lg_loss = 0
             for n, p in self.model.named_parameters():
@@ -249,9 +280,7 @@ class Client():
                 local_d = self.local_delta[n].detach().clone().to(self.device)
                 local_grad = torch.flatten(local_d)
                 lg_loss += (p * local_grad.detach()).sum()
-            losses["Dyn"] = - lg_loss + 0.5 * self.args.client.Dyn.alpha * prox_loss
+            losses["Dyn"] = -lg_loss + 0.5 * self.args.client.Dyn.alpha * prox_loss
 
         del results
         return losses
-
-

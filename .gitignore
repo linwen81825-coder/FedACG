@@ -6,3 +6,6 @@ checkpoints/**
 __pycache__/
 
 *.log
+*.md
+*outputs
+*.txt

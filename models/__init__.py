@@ -4,6 +4,7 @@ from models.resnet import *
 # from models.generator import *
 
 from models.resnet_base import *
+from models.resnet_moe import *
 from models.resnet_MLB import *
 from models.MobileNet import *
 from models.SqueezeNet import *

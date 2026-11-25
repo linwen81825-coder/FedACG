@@ -1,0 +1,11 @@
+## ResNet18 with a global Mixture-of-Experts classification head ##
+name: "ResNet18_MoE"
+pretrained: False
+l2_norm: False
+use_bn_layer: False
+last_feature_dim: 512
+
+moe: True
+num_experts: 4
+top_k: 2
+aux_loss_weight: 0.01
