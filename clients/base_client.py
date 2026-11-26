@@ -4,6 +4,7 @@ import copy
 import time
 
 import matplotlib.pyplot as plt
+import torch
 import torch.multiprocessing as mp
 import gc
 
@@ -38,6 +39,20 @@ class Client():
         self.decorr_criterion = FedDecorrLoss()
 
         return
+
+    @staticmethod
+    def _expert_index_from_name(param_name):
+        """Return 0 for fc (Expert 0), or 1..E-1 for expert_heads.*."""
+        if param_name.startswith("fc."):
+            return 0
+        if param_name.startswith("expert_heads."):
+            parts = param_name.split(".")
+            if len(parts) >= 3:
+                try:
+                    return int(parts[1]) + 1
+                except ValueError:
+                    return None
+        return None
 
     def setup(self, state_dict, device, local_dataset, local_lr, global_epoch, trainer, **kwargs):
 
@@ -132,7 +147,7 @@ class Client():
         if self.args.client.get('Dyn'):
             weights['Dyn'] = self.args.client.Dyn.weight
 
-        # Add the MoE load-balancing loss only when the MoE model is selected.
+        # MoE load-balancing auxiliary loss.
         if self.args.model.get('moe', False):
             weights['moe_aux'] = float(self.args.model.get('aux_loss_weight', 0.01))
 
@@ -143,6 +158,17 @@ class Client():
 
         self.model.to(self.device)
         self.global_model.to(self.device)
+
+        is_moe = bool(self.args.model.get('moe', False))
+        if is_moe:
+            self.expert_usage_counts = torch.zeros(
+                int(self.model.num_experts),
+                dtype=torch.long,
+                device=self.device
+            )
+        else:
+            self.expert_usage_counts = None
+
         scaler = GradScaler()
         start = time.time()
         loss_meter = AverageMeter('Loss', ':.2f')
@@ -204,6 +230,11 @@ class Client():
 
         gc.collect()
 
+        if self.expert_usage_counts is not None:
+            expert_usage = self.expert_usage_counts.detach().cpu().clone()
+            return self.model.state_dict(), loss_dict, expert_usage
+
+        # Keep the original two-item return contract for non-MoE experiments.
         return self.model.state_dict(), loss_dict
 
     def _algorithm(self, images, labels) -> Dict:
@@ -213,16 +244,48 @@ class Client():
         cls_loss = self.criterion(results["logit"], labels)
         losses["cls"] = cls_loss
 
+        # Track which experts this client actually used during local training.
+        if self.expert_usage_counts is not None:
+            if "expert_indices" not in results:
+                raise KeyError(
+                    "MoE model must return 'expert_indices' for expert-aware aggregation."
+                )
+            batch_usage = torch.bincount(
+                results["expert_indices"].detach().reshape(-1),
+                minlength=self.expert_usage_counts.numel()
+            )
+            self.expert_usage_counts += batch_usage
+
         # MoE load-balancing auxiliary loss.
         if "aux_loss" in results:
             losses["moe_aux"] = results["aux_loss"]
 
-        # Weight L2 loss
+        # Proximal regularization:
+        # - MoE + ACG: constrain only experts selected in this batch.
+        # - Non-MoE: preserve the original all-parameter proximal term.
         if self.args.client.get('prox_loss'):
             prox_loss = 0
             fixed_params = {n: p for n, p in self.global_model.named_parameters()}
-            for n, p in self.model.named_parameters():
-                prox_loss += ((p - fixed_params[n].detach()) ** 2).sum()
+
+            if (
+                self.args.model.get('moe', False)
+                and self.args.server.get('FedACG', False)
+            ):
+                active_experts = set(
+                    results["expert_indices"].detach().reshape(-1).cpu().tolist()
+                )
+                for name, param in self.model.named_parameters():
+                    expert_idx = self._expert_index_from_name(name)
+                    if expert_idx in active_experts:
+                        prox_loss += (
+                            (param - fixed_params[name].detach()) ** 2
+                        ).sum()
+            else:
+                for name, param in self.model.named_parameters():
+                    prox_loss += (
+                        (param - fixed_params[name].detach()) ** 2
+                    ).sum()
+
             losses["prox"] = prox_loss
 
         # FedLC
