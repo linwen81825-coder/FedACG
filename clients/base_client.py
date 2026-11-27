@@ -39,6 +39,24 @@ class Client():
 
         return
 
+    @staticmethod
+    def _is_expert_parameter(param_name):
+        """
+        ResNet18_MoE parameter naming:
+          - fc.*: Expert 0
+          - expert_heads.*: remaining Experts
+        """
+        return (
+            param_name.startswith("fc.")
+            or param_name.startswith("expert_heads.")
+        )
+
+    def _uses_moe_fedacg(self):
+        return (
+            bool(self.args.server.get("FedACG", False))
+            and bool(self.args.model.get("moe", False))
+        )
+
     def setup(self, state_dict, device, local_dataset, local_lr, global_epoch, trainer, **kwargs):
 
         self._update_model(state_dict)
@@ -217,12 +235,20 @@ class Client():
         if "aux_loss" in results:
             losses["moe_aux"] = results["aux_loss"]
 
-        # Weight L2 loss
+        # Original FedACG proximal regularization is retained for
+        # Backbone + Router only. Expert parameters use plain FedAvg:
+        # no FedACG lookahead, no FedACG momentum, and no FedACG proximal term.
         if self.args.client.get('prox_loss'):
             prox_loss = 0
             fixed_params = {n: p for n, p in self.global_model.named_parameters()}
+
             for n, p in self.model.named_parameters():
-                prox_loss += ((p - fixed_params[n].detach()) ** 2).sum()
+                if self._uses_moe_fedacg() and self._is_expert_parameter(n):
+                    continue
+                prox_loss += (
+                    (p - fixed_params[n].detach()) ** 2
+                ).sum()
+
             losses["prox"] = prox_loss
 
         # FedLC
@@ -273,7 +299,7 @@ class Client():
             del global_results
 
         # FedDyn
-        if self.args.client.get('Dyn'):
+        if self.args.client.get("Dyn"):
             lg_loss = 0
             for n, p in self.model.named_parameters():
                 p = torch.flatten(p)
